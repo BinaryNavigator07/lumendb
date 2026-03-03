@@ -123,6 +123,32 @@ impl LumenEngine {
         Ok(Self { index, vault, dim })
     }
 
+    /// Re-open an existing LumenDB collection whose configuration is already
+    /// stored on disk.  Unlike [`open`], no `dim`, `metric`, or `params` are
+    /// required — they are read from the persisted [`StoredConfig`].
+    ///
+    /// Use this at server startup to recover collections that were created in a
+    /// previous session without having to remember their creation parameters.
+    ///
+    /// # Errors
+    /// - `LumenError::ConfigMismatch` if the directory contains no stored config
+    ///   (i.e. it is not a LumenDB collection).
+    /// - `LumenError::Storage` for I/O failures.
+    pub fn reopen<P: AsRef<Path>>(path: P) -> Result<Self, LumenError> {
+        // Peek at the stored config to discover dim / metric / params
+        let peek   = SledVault::open(path.as_ref())?;
+        let cfg    = peek.load_config()?.ok_or_else(|| {
+            LumenError::ConfigMismatch(
+                "no stored config — directory is not a LumenDB collection".into(),
+            )
+        })?;
+        let metric = cfg.metric()?;
+        let params = cfg.hnsw_params();
+        let dim    = cfg.dim;
+        drop(peek); // release the temporary handle before the real open
+        Self::open(path, params, metric, dim)
+    }
+
     // ── Insert ────────────────────────────────────────────────────────────────
 
     /// Insert a vector with associated metadata.

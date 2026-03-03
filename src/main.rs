@@ -1,130 +1,174 @@
-//! LumenDB — CLI demo (Milestones 1, 2 & 3).
+//! LumenDB — Milestone 4: The Nexus (Axum REST gateway).
+//!
+//! # Usage
+//!
+//! ```sh
+//! # Start with defaults (port 7070, no auth, ./lumendb_data)
+//! cargo run --release
+//!
+//! # Custom port + API key
+//! cargo run --release -- --port 8080 --api-key secret123
+//!
+//! # Persist collections somewhere else
+//! cargo run --release -- --data-dir /var/lib/lumendb
+//! ```
+//!
+//! # Quick-start (curl)
+//!
+//! ```sh
+//! # Create a 3-dim cosine collection
+//! curl -s -X POST http://localhost:7070/v1/collections \
+//!   -H 'Content-Type: application/json' \
+//!   -d '{"name":"demo","dim":3,"metric":"cosine"}' | jq
+//!
+//! # Insert a vector
+//! curl -s -X POST http://localhost:7070/v1/collections/demo/vectors \
+//!   -H 'Content-Type: application/json' \
+//!   -d '{"vector":[1.0,0.0,0.0],"metadata":{"label":"x-axis"}}' | jq
+//!
+//! # Search
+//! curl -s -X POST http://localhost:7070/v1/collections/demo/search \
+//!   -H 'Content-Type: application/json' \
+//!   -d '{"vector":[1.0,0.1,0.0],"k":1}' | jq
+//! ```
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use clap::Parser;
 
 use lumendb::{
-    engine::LumenEngine,
-    index::params::HnswParams,
-    metrics::{self, Metric},
+    api::{build_router, AppState},
+    LumenEngine,
 };
-use std::time::Instant;
 
-fn main() {
-    println!("╔══════════════════════════════════════════════╗");
-    println!("║             LumenDB  v0.1.0                  ║");
-    println!("║  Milestone 3 — The Vault  (WAL + Warm Boot)  ║");
-    println!("╚══════════════════════════════════════════════╝");
-    println!();
-    println!("SIMD backend : {}", metrics::active_backend());
-    println!();
+// ── CLI ───────────────────────────────────────────────────────────────────────
 
-    // ── Configuration ─────────────────────────────────────────────────────────
-    let db_path   = "/tmp/lumendb_demo";
-    let params    = HnswParams::builder().m(16).ef_construction(200).ef_search(50).build();
-    let metric    = Metric::Cosine;
-    let dim: usize = 256; // smaller dim for a fast demo
-    let n: u32     = 5_000;
-    let k: usize   = 5;
+#[derive(Parser, Debug)]
+#[command(
+    name    = "lumendb",
+    version,
+    about   = "LumenDB — pure-Rust vector search engine with REST API",
+    long_about = None,
+)]
+struct Args {
+    /// TCP port to listen on.
+    #[arg(long, default_value = "7070")]
+    port: u16,
 
-    // Xorshift-64 RNG (no external crate)
-    let mut rng: u64 = 0xdead_c0de_cafe_beef;
-    let mut rand_f32 = move || -> f32 {
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
-        (rng >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0
-    };
+    /// Host address to bind (use 0.0.0.0 to accept external connections).
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
 
-    let vectors: Vec<Vec<f32>> = (0..n)
-        .map(|_| (0..dim).map(|_| rand_f32()).collect())
-        .collect();
+    /// Base directory where collections are stored on disk.
+    #[arg(long, default_value = "./lumendb_data")]
+    data_dir: PathBuf,
 
-    // ── Session 1: insert and persist ─────────────────────────────────────────
-    println!("── Session 1: Insert + persist  ({n} × {dim}-dim) ────────────");
-    {
-        // Clean up any previous run so the demo is reproducible
-        let _ = std::fs::remove_dir_all(db_path);
+    /// Require this value in the `X-API-KEY` request header.
+    /// If omitted, the API is unauthenticated (development mode).
+    #[arg(long)]
+    api_key: Option<String>,
+}
 
-        let engine = LumenEngine::open(db_path, params.clone(), metric, dim)
-            .expect("failed to open engine");
+// ── Entry point ───────────────────────────────────────────────────────────────
 
-        let t = Instant::now();
-        for (i, v) in vectors.iter().enumerate() {
-            let meta = serde_json::json!({ "index": i, "source": "demo" });
-            engine.insert(v.clone(), meta).expect("insert failed");
+#[tokio::main]
+async fn main() {
+    let args = Args::parse();
+
+    // Ensure the data directory exists
+    std::fs::create_dir_all(&args.data_dir)
+        .unwrap_or_else(|e| panic!("cannot create data directory {:?}: {e}", args.data_dir));
+
+    let addr: SocketAddr = format!("{}:{}", args.host, args.port)
+        .parse()
+        .expect("invalid host/port combination");
+
+    let state = AppState::new(args.data_dir.clone(), args.api_key.clone());
+
+    // ── Auto-load existing collections from disk ──────────────────────────────
+    // Any subdirectory that contains a valid LumenDB Sled database is opened
+    // automatically so collections survive server restarts without needing to
+    // be explicitly re-created via the API.
+    let mut loaded = 0usize;
+    if let Ok(entries) = std::fs::read_dir(&args.data_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            match LumenEngine::reopen(&path) {
+                Ok(engine) => {
+                    let n = engine.len();
+                    state.collections.write().insert(name.clone(), Arc::new(engine));
+                    eprintln!("  Loaded '{name}'  ({n} vectors)");
+                    loaded += 1;
+                }
+                Err(_) => {} // not a LumenDB directory — silently skip
+            }
         }
-        let ms  = t.elapsed().as_millis();
-        let ips = n as f64 / t.elapsed().as_secs_f64();
-        println!("  Inserted {n} vectors in {ms} ms  ({ips:.0} inserts/s)");
-        println!("  Every write fsynced — data is durable.");
-        println!("  Index size: {} nodes", engine.len());
-        println!();
-
-        // ── Search before shutdown ─────────────────────────────────────────────
-        let query  = &vectors[0];
-        let hits   = engine.search(query, k).expect("search failed");
-        println!("  Pre-shutdown top-{k} for vectors[0]:");
-        for (rank, h) in hits.iter().enumerate() {
-            println!("    #{:<2}  id={:<5}  dist={:.6}  meta={}", rank+1, h.id, h.distance, h.metadata);
-        }
-        assert_eq!(hits[0].id, 0, "vectors[0] must be its own nearest neighbour");
-        println!("  ✓ Exact-match recall confirmed before shutdown.");
-    } // `engine` dropped here; Sled flushes on drop
-    println!();
-
-    // ── Session 2: warm boot ──────────────────────────────────────────────────
-    println!("── Session 2: Warm boot (process restart simulation) ─────────");
-    {
-        let t = Instant::now();
-        let engine = LumenEngine::open(db_path, params.clone(), metric, dim)
-            .expect("failed to reopen engine");
-        let boot_ms = t.elapsed().as_millis();
-
-        println!("  Recovered {} vectors in {boot_ms} ms", engine.len());
-        assert_eq!(
-            engine.len(), n as usize,
-            "all {n} vectors must survive the restart"
-        );
-        println!("  ✓ All {n} vectors recovered.");
-        println!();
-
-        // ── Search after warm boot ─────────────────────────────────────────────
-        let query  = &vectors[0];
-        let t_q    = Instant::now();
-        let hits   = engine.search(query, k).expect("post-boot search failed");
-        let qus    = t_q.elapsed().as_micros();
-
-        println!("  Post-boot top-{k} for vectors[0]  ({qus} µs):");
-        for (rank, h) in hits.iter().enumerate() {
-            println!("    #{:<2}  id={:<5}  dist={:.6}  meta={}", rank+1, h.id, h.distance, h.metadata);
-        }
-        assert_eq!(hits[0].id, 0, "exact-match recall must hold after warm boot");
-        println!("  ✓ Exact-match recall confirmed after warm boot.");
-        println!();
-
-        // ── Metadata round-trip ───────────────────────────────────────────────
-        let meta = engine.vault.get_metadata(42).expect("get_metadata failed");
-        println!("  Metadata for id=42: {}", meta.unwrap_or(serde_json::Value::Null));
-
-        // ── Snapshot (FR-5) ───────────────────────────────────────────────────
-        let snap_path = "/tmp/lumendb_snapshot";
-        let _ = std::fs::remove_dir_all(snap_path);
-        engine.snapshot_to(snap_path).expect("snapshot failed");
-        println!("  ✓ Hot snapshot written to {snap_path}");
-        println!();
-
-        // ── Throughput benchmark ──────────────────────────────────────────────
-        println!("── Query throughput  (100 queries × top-{k}) ────────────────");
-        let queries: Vec<Vec<f32>> = vectors.iter().take(100).cloned().collect();
-        let t_bench = Instant::now();
-        let mut sink = 0usize;
-        for q in &queries {
-            sink += engine.search(q, k).unwrap().len();
-        }
-        let bench_ms = t_bench.elapsed().as_millis();
-        let qps = 100.0 / t_bench.elapsed().as_secs_f64();
-        let _ = sink;
-        println!("  100 queries in {bench_ms} ms  ({qps:.0} QPS)");
     }
 
+    let app = build_router(state);
+
+    // ── Banner ────────────────────────────────────────────────────────────────
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║             LumenDB  v{}                  ║", env!("CARGO_PKG_VERSION"));
+    println!("║          Milestone 4 — The Nexus             ║");
+    println!("╚══════════════════════════════════════════════╝");
     println!();
-    println!("Milestone 3 complete.  Next: Axum REST gateway (Milestone 4).");
+    println!("  Data dir  : {:?}", args.data_dir);
+    println!("  Listening : http://{addr}");
+    if args.api_key.is_some() {
+        println!("  Auth      : X-API-KEY header required");
+    } else {
+        println!("  Auth      : disabled (development mode)");
+    }
+    if loaded > 0 {
+        println!("  Collections loaded from disk: {loaded}");
+    }
+    println!();
+    println!("  Press Ctrl+C to stop.");
+    println!();
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .unwrap_or_else(|e| panic!("cannot bind to {addr}: {e}"));
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("server error");
+
+    println!("\nServer shut down gracefully.");
+}
+
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
+
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c    => { eprintln!("Received Ctrl+C — shutting down…"); }
+        _ = terminate => { eprintln!("Received SIGTERM — shutting down…"); }
+    }
 }

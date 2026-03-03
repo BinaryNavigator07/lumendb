@@ -32,7 +32,8 @@ use crate::LumenError;
 // ── Distance metric enum ──────────────────────────────────────────────────────
 
 /// The three distance / similarity metrics supported by LumenDB (FR-1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Metric {
     /// Inner product.  For unit vectors this equals cosine similarity.
     DotProduct,

@@ -8,8 +8,9 @@
 //! | 1 | `metrics`   | Done    | SIMD-optimised distance kernels (NEON/AVX2) |
 //! | 2 | `index`     | Done    | HNSW graph index (The Weaver)            |
 //! | 3 | `storage`   | Done    | Sled-backed WAL + hot snapshots          |
-//! | 4 | *(api)*     | Pending | Axum REST / gRPC gateway (The Nexus)     |
+//! | 4 | `api`       | Done    | Axum REST gateway (The Nexus)            |
 
+pub mod api;
 pub mod engine;
 pub mod error;
 pub mod index;
