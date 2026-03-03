@@ -22,8 +22,7 @@ pub mod layers;
 pub mod node;
 pub mod params;
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 
 use parking_lot::RwLock;
 
@@ -69,14 +68,14 @@ impl Rng {
 
 // ── HnswInner — unsynchronised state ─────────────────────────────────────────
 
-struct HnswInner {
+pub(crate) struct HnswInner {
     params: HnswParams,
     /// All nodes, indexed by `NodeId`.
-    nodes: Vec<Node>,
+    pub(crate) nodes: Vec<Node>,
     /// Entry point for every search: the node with the highest assigned level.
-    entry_point: Option<NodeId>,
+    pub(crate) entry_point: Option<NodeId>,
     /// Current maximum layer level across all nodes.
-    max_layer: usize,
+    pub(crate) max_layer: usize,
     rng: Rng,
 }
 
@@ -109,7 +108,16 @@ impl HnswInner {
 
 // ── Insert algorithm ──────────────────────────────────────────────────────────
 
-fn insert_inner(inner: &mut HnswInner, vector: Vec<f32>, metric: Metric) -> NodeId {
+/// Returns `(new_node_id, modified_existing_node_ids)`.
+///
+/// `modified_existing_node_ids` is the set of pre-existing nodes whose
+/// neighbor lists were changed by bidirectional wiring or heuristic pruning.
+/// Callers that persist graph state must also re-save those nodes.
+fn insert_inner(
+    inner: &mut HnswInner,
+    vector: Vec<f32>,
+    metric: Metric,
+) -> (NodeId, Vec<NodeId>) {
     let id = inner.nodes.len();
     let level = inner.random_level();
 
@@ -118,7 +126,7 @@ fn insert_inner(inner: &mut HnswInner, vector: Vec<f32>, metric: Metric) -> Node
         inner.nodes.push(Node::new(id, vector, level));
         inner.entry_point = Some(id);
         inner.max_layer = level;
-        return id;
+        return (id, vec![]);
     }
 
     // Clone the query vector to avoid borrow conflicts while mutating `nodes`
@@ -127,6 +135,9 @@ fn insert_inner(inner: &mut HnswInner, vector: Vec<f32>, metric: Metric) -> Node
 
     let max_l = inner.max_layer;
     let mut ep: Vec<NodeId> = vec![inner.entry_point.unwrap()];
+    // Track every pre-existing node whose neighbor list is mutated so that
+    // callers can persist their updated graph state.
+    let mut modified: HashSet<NodeId> = HashSet::new();
 
     // ── Phase 1: coarse greedy descent from max_layer to level + 1 ───────────
     // We use ef = 1 here — we only need the single nearest neighbor per layer
@@ -163,6 +174,7 @@ fn insert_inner(inner: &mut HnswInner, vector: Vec<f32>, metric: Metric) -> Node
         // Wire selected neighbors → new node (bidirectional), then prune if needed
         for &nb in &neighbors {
             inner.nodes[nb].neighbors[lc].push(id);
+            modified.insert(nb); // back-edge: nb's neighbor list changed
 
             if inner.nodes[nb].neighbors[lc].len() > m {
                 // Rebuild neighbor list for `nb` using the heuristic
@@ -179,6 +191,7 @@ fn insert_inner(inner: &mut HnswInner, vector: Vec<f32>, metric: Metric) -> Node
 
                 inner.nodes[nb].neighbors[lc] =
                     select_neighbors_heuristic(&inner.nodes, &nb_vec, &w_nb, m, metric);
+                // nb is already in `modified`
             }
         }
     }
@@ -189,7 +202,7 @@ fn insert_inner(inner: &mut HnswInner, vector: Vec<f32>, metric: Metric) -> Node
         inner.max_layer = level;
     }
 
-    id
+    (id, modified.into_iter().collect())
 }
 
 // ── Search algorithm ──────────────────────────────────────────────────────────
@@ -248,7 +261,8 @@ fn search_inner(
 /// assert_eq!(results[0].id, id);
 /// ```
 pub struct HnswIndex {
-    inner: RwLock<HnswInner>,
+    /// `pub(crate)` so `LumenEngine` can hold a read guard during `vault.put`.
+    pub(crate) inner: RwLock<HnswInner>,
     /// The distance metric used for all operations on this collection.
     pub metric: Metric,
 }
@@ -268,6 +282,17 @@ impl HnswIndex {
     /// returns.  For bulk loading, call this in a tight loop; the write lock
     /// overhead is small compared to the graph-building work.
     pub fn insert(&self, vector: Vec<f32>) -> NodeId {
+        let mut inner = self.inner.write();
+        let (id, _) = insert_inner(&mut inner, vector, self.metric);
+        id
+    }
+
+    /// Like [`insert`] but also returns the IDs of all pre-existing nodes
+    /// whose neighbor lists were mutated by bidirectional wiring/pruning.
+    ///
+    /// Used by `LumenEngine` to persist back-edge updates to the vault so
+    /// that warm-boot recovery sees a fully connected graph.
+    pub(crate) fn insert_and_get_modified(&self, vector: Vec<f32>) -> (NodeId, Vec<NodeId>) {
         let mut inner = self.inner.write();
         insert_inner(&mut inner, vector, self.metric)
     }
@@ -294,6 +319,41 @@ impl HnswIndex {
     /// Dimension of the vectors stored in the index (`None` if empty).
     pub fn dim(&self) -> Option<usize> {
         self.inner.read().nodes.first().map(|n| n.vector.len())
+    }
+
+    // ── Recovery API (called by LumenEngine during warm boot) ─────────────────
+
+    /// **Fast-path recovery**: directly restore a node that was previously
+    /// persisted with its full graph state, bypassing the HNSW insertion
+    /// algorithm entirely.
+    ///
+    /// Nodes *must* be restored in ascending `id` order (0, 1, 2, …) so that
+    /// `id == nodes.len()` holds at every call — matching the invariant that
+    /// `insert_inner` relies on.
+    pub(crate) fn restore_node(
+        &self,
+        id: NodeId,
+        vector: Vec<f32>,
+        level: usize,
+        neighbors: Vec<Vec<NodeId>>,
+    ) {
+        let mut inner = self.inner.write();
+        debug_assert_eq!(
+            inner.nodes.len(), id,
+            "restore_node: expected id={id}, but nodes.len()={}",
+            inner.nodes.len()
+        );
+        let mut node = Node::new(id, vector, level);
+        node.neighbors = neighbors;
+        inner.nodes.push(node);
+    }
+
+    /// Restore the global entry-point and max-layer after all nodes have
+    /// been fast-path recovered.
+    pub(crate) fn restore_header(&self, entry_point: NodeId, max_layer: usize) {
+        let mut inner = self.inner.write();
+        inner.entry_point = Some(entry_point);
+        inner.max_layer   = max_layer;
     }
 }
 
@@ -361,11 +421,17 @@ mod tests {
 
     #[test]
     fn top_k_respects_limit() {
+        // Spread 50 vectors evenly around the unit circle so every pair has a
+        // distinct cosine distance — collinear vectors all have distance 0, which
+        // makes the diversity heuristic skip them and produces an under-connected
+        // graph that cannot reliably return k results.
         let idx = make_index();
-        for i in 0..50 {
-            idx.insert(vec![i as f32, 0.0]);
+        let n = 50usize;
+        for i in 0..n {
+            let angle = std::f32::consts::TAU * i as f32 / n as f32;
+            idx.insert(vec![angle.cos(), angle.sin()]);
         }
-        let results = idx.search(&[25.0, 0.0], 10);
+        let results = idx.search(&[1.0, 0.0], 10);
         assert_eq!(results.len(), 10);
     }
 

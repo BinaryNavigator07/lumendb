@@ -1,37 +1,32 @@
+//! LumenDB — CLI demo (Milestones 1, 2 & 3).
 
 use lumendb::{
-    index::{params::HnswParams, HnswIndex},
+    engine::LumenEngine,
+    index::params::HnswParams,
     metrics::{self, Metric},
 };
 use std::time::Instant;
 
 fn main() {
-    println!("╔══════════════════════════════════════════╗");
-    println!("║           LumenDB  v0.1.0                ║");
-    println!("║  Milestone 2 — HNSW Index (The Weaver)   ║");
-    println!("╚══════════════════════════════════════════╝");
+    println!("╔══════════════════════════════════════════════╗");
+    println!("║             LumenDB  v0.1.0                  ║");
+    println!("║  Milestone 3 — The Vault  (WAL + Warm Boot)  ║");
+    println!("╚══════════════════════════════════════════════╝");
     println!();
     println!("SIMD backend : {}", metrics::active_backend());
     println!();
 
     // ── Configuration ─────────────────────────────────────────────────────────
-    let params = HnswParams::builder()
-        .m(16)
-        .ef_construction(200)
-        .ef_search(50)
-        .build();
-    let metric = Metric::Cosine;
-    let dim    = 1536; // OpenAI text-embedding-3-small dimensions
-    let n      = 10_000u32;
-    let k      = 10;
+    let db_path   = "/tmp/lumendb_demo";
+    let params    = HnswParams::builder().m(16).ef_construction(200).ef_search(50).build();
+    let metric    = Metric::Cosine;
+    let dim: usize = 256; // smaller dim for a fast demo
+    let n: u32     = 5_000;
+    let k: usize   = 5;
 
-    // ── Build phase ───────────────────────────────────────────────────────────
-    println!("── Build  ({n} × {dim}-dim vectors, M=16, ef_c=200) ────────");
-    let index = HnswIndex::new(params, metric);
-
-    // Reproducible pseudo-random vectors via Xorshift-64
-    let mut rng: u64 = 0xfeed_c0de_babe_cafe;
-    let mut next = move || -> f32 {
+    // Xorshift-64 RNG (no external crate)
+    let mut rng: u64 = 0xdead_c0de_cafe_beef;
+    let mut rand_f32 = move || -> f32 {
         rng ^= rng << 13;
         rng ^= rng >> 7;
         rng ^= rng << 17;
@@ -39,68 +34,97 @@ fn main() {
     };
 
     let vectors: Vec<Vec<f32>> = (0..n)
-        .map(|_| (0..dim).map(|_| next()).collect())
+        .map(|_| (0..dim).map(|_| rand_f32()).collect())
         .collect();
 
-    let t_build = Instant::now();
-    for v in &vectors {
-        index.insert(v.clone());
+    // ── Session 1: insert and persist ─────────────────────────────────────────
+    println!("── Session 1: Insert + persist  ({n} × {dim}-dim) ────────────");
+    {
+        // Clean up any previous run so the demo is reproducible
+        let _ = std::fs::remove_dir_all(db_path);
+
+        let engine = LumenEngine::open(db_path, params.clone(), metric, dim)
+            .expect("failed to open engine");
+
+        let t = Instant::now();
+        for (i, v) in vectors.iter().enumerate() {
+            let meta = serde_json::json!({ "index": i, "source": "demo" });
+            engine.insert(v.clone(), meta).expect("insert failed");
+        }
+        let ms  = t.elapsed().as_millis();
+        let ips = n as f64 / t.elapsed().as_secs_f64();
+        println!("  Inserted {n} vectors in {ms} ms  ({ips:.0} inserts/s)");
+        println!("  Every write fsynced — data is durable.");
+        println!("  Index size: {} nodes", engine.len());
+        println!();
+
+        // ── Search before shutdown ─────────────────────────────────────────────
+        let query  = &vectors[0];
+        let hits   = engine.search(query, k).expect("search failed");
+        println!("  Pre-shutdown top-{k} for vectors[0]:");
+        for (rank, h) in hits.iter().enumerate() {
+            println!("    #{:<2}  id={:<5}  dist={:.6}  meta={}", rank+1, h.id, h.distance, h.metadata);
+        }
+        assert_eq!(hits[0].id, 0, "vectors[0] must be its own nearest neighbour");
+        println!("  ✓ Exact-match recall confirmed before shutdown.");
+    } // `engine` dropped here; Sled flushes on drop
+    println!();
+
+    // ── Session 2: warm boot ──────────────────────────────────────────────────
+    println!("── Session 2: Warm boot (process restart simulation) ─────────");
+    {
+        let t = Instant::now();
+        let engine = LumenEngine::open(db_path, params.clone(), metric, dim)
+            .expect("failed to reopen engine");
+        let boot_ms = t.elapsed().as_millis();
+
+        println!("  Recovered {} vectors in {boot_ms} ms", engine.len());
+        assert_eq!(
+            engine.len(), n as usize,
+            "all {n} vectors must survive the restart"
+        );
+        println!("  ✓ All {n} vectors recovered.");
+        println!();
+
+        // ── Search after warm boot ─────────────────────────────────────────────
+        let query  = &vectors[0];
+        let t_q    = Instant::now();
+        let hits   = engine.search(query, k).expect("post-boot search failed");
+        let qus    = t_q.elapsed().as_micros();
+
+        println!("  Post-boot top-{k} for vectors[0]  ({qus} µs):");
+        for (rank, h) in hits.iter().enumerate() {
+            println!("    #{:<2}  id={:<5}  dist={:.6}  meta={}", rank+1, h.id, h.distance, h.metadata);
+        }
+        assert_eq!(hits[0].id, 0, "exact-match recall must hold after warm boot");
+        println!("  ✓ Exact-match recall confirmed after warm boot.");
+        println!();
+
+        // ── Metadata round-trip ───────────────────────────────────────────────
+        let meta = engine.vault.get_metadata(42).expect("get_metadata failed");
+        println!("  Metadata for id=42: {}", meta.unwrap_or(serde_json::Value::Null));
+
+        // ── Snapshot (FR-5) ───────────────────────────────────────────────────
+        let snap_path = "/tmp/lumendb_snapshot";
+        let _ = std::fs::remove_dir_all(snap_path);
+        engine.snapshot_to(snap_path).expect("snapshot failed");
+        println!("  ✓ Hot snapshot written to {snap_path}");
+        println!();
+
+        // ── Throughput benchmark ──────────────────────────────────────────────
+        println!("── Query throughput  (100 queries × top-{k}) ────────────────");
+        let queries: Vec<Vec<f32>> = vectors.iter().take(100).cloned().collect();
+        let t_bench = Instant::now();
+        let mut sink = 0usize;
+        for q in &queries {
+            sink += engine.search(q, k).unwrap().len();
+        }
+        let bench_ms = t_bench.elapsed().as_millis();
+        let qps = 100.0 / t_bench.elapsed().as_secs_f64();
+        let _ = sink;
+        println!("  100 queries in {bench_ms} ms  ({qps:.0} QPS)");
     }
-    let build_ms = t_build.elapsed().as_millis();
-    let ins_per_sec = (n as f64 / t_build.elapsed().as_secs_f64()) as u64;
-    println!("  Indexed {n} vectors in {build_ms} ms  ({ins_per_sec} inserts/s)");
-    println!("  Index size    : {} nodes", index.len());
-    println!("  Vector dim    : {}",       index.dim().unwrap());
+
     println!();
-
-    // ── Query phase ───────────────────────────────────────────────────────────
-    println!("── Query  (top-{k}, ef_search=50) ──────────────────────────");
-
-    // Query 1: exact lookup — expect 0.0 cosine distance for the first vector
-    let query = vectors[0].clone();
-    let t_q = Instant::now();
-    let results = index.search(&query, k);
-    let query_us = t_q.elapsed().as_micros();
-
-    println!("  Query time    : {query_us} µs");
-    println!("  Top-{k} results (expect id=0 at distance≈0.0):");
-    for (rank, r) in results.iter().enumerate() {
-        println!("    #{:<2}  id={:<5}  dist={:.6}", rank + 1, r.id, r.distance);
-    }
-    println!();
-
-    // Verify the closest result is the query vector itself
-    assert_eq!(
-        results[0].id, 0,
-        "Expected id=0 as nearest to itself, got id={}",
-        results[0].id
-    );
-    assert!(
-        results[0].distance < 1e-4,
-        "Expected near-zero distance, got {}",
-        results[0].distance
-    );
-    println!("  ✓ Exact-match recall confirmed (id=0, dist≈0)");
-    println!();
-
-    // ── Throughput benchmark ──────────────────────────────────────────────────
-    println!("── Throughput benchmark  ({n} random queries × 1 iter) ──────");
-
-    // Pre-generate query vectors
-    let queries: Vec<Vec<f32>> = (0..100)
-        .map(|_| (0..dim).map(|_| next()).collect())
-        .collect();
-
-    let t_bench = Instant::now();
-    let mut sink = 0usize;
-    for q in &queries {
-        sink += index.search(q, k).len();
-    }
-    let bench_ms = t_bench.elapsed().as_millis();
-    let qps = (queries.len() as f64 / t_bench.elapsed().as_secs_f64()) as u64;
-    let _ = sink;
-
-    println!("  100 queries in {bench_ms} ms  ({qps} QPS)");
-    println!();
-    println!("Milestone 2 complete.  Next: Sled Vault + WAL (Milestone 3).");
+    println!("Milestone 3 complete.  Next: Axum REST gateway (Milestone 4).");
 }

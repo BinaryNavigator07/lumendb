@@ -115,7 +115,7 @@ pub(super) fn search_layer(
 /// * `m` — maximum number of neighbors to return.
 pub(super) fn select_neighbors_heuristic(
     nodes: &[Node],
-    query: &[f32],
+    _query: &[f32],
     candidates: &BinaryHeap<DistancedNode>,
     m: usize,
     metric: Metric,
