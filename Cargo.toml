@@ -1,0 +1,32 @@
+[package]
+name        = "lumendb"
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["Rizwan Nisar"]
+description = "Pure-Rust, zero-dependency vector search engine"
+
+[lib]
+name = "lumendb"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lumendb"
+path = "src/main.rs"
+
+[dependencies]
+# High-performance mutex/rwlock — avoids OS-level fairness overhead.
+# Pure Rust, no C deps, links statically.
+parking_lot = "0.12"
+
+[dev-dependencies]
+# criterion = { version = "0.5", features = ["html_reports"] }  # add in Milestone 4
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"
+
+[profile.dev]
+opt-level = 1   # partial opt keeps SIMD tests fast in dev
