@@ -2,7 +2,7 @@
 name        = "lumendb"
 version     = "0.1.0"
 edition     = "2021"
-authors     = ["Rizwan Nisar"]
+authors     = ["Umair Sajid"]
 description = "Pure-Rust, zero-C-dependency vector search engine"
 
 [lib]
