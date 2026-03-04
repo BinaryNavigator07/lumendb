@@ -430,41 +430,39 @@ with LumenDB("http://localhost:7070", api_key="my-secret") as db:
 
 ## Architecture Overview
 
+<div align="center">
+  <img src="assets/architecture.png" alt="LumenDB System Architecture" width="900"/>
+</div>
+
+The diagram above shows the full request path from HTTP client through the Axum
+gateway, into `LumenEngine` (which coordinates the in-memory HNSW graph and the
+Sled-backed vault), down to the four Sled trees that persist every vector,
+metadata blob, graph adjacency list, and collection config to disk.
+
+**Data flow — insert:**
+
 ```
-  HTTP Client
-       │
-       ▼
-  ┌─────────────────────────────────────────────────────┐
-  │                  Axum REST Gateway                  │
-  │   auth_layer (X-API-KEY) → route → handler          │
-  └────────────────────────┬────────────────────────────┘
-                           │  Arc<LumenEngine>
-                           ▼
-  ┌─────────────────────────────────────────────────────┐
-  │                   LumenEngine                       │
-  │                                                     │
-  │   insert()  ──►  HnswIndex (write lock)             │
-  │                       │                             │
-  │                  insert_inner()                     │
-  │                  returns (id, modified_nodes)       │
-  │                       │                             │
-  │                  SledVault.put()                    │
-  │                  SledVault.update_graph_node()  ×N  │
-  │                  SledVault.flush()   ← fsync        │
-  │                                                     │
-  │   search()  ──►  HnswIndex (read lock, concurrent)  │
-  │                  search_inner()  →  SledVault.get_metadata() │
-  └─────────────────────────────────────────────────────┘
-                           │
-                           ▼
-  ┌─────────────────────────────────────────────────────┐
-  │              Sled (embedded KV store)               │
-  │                                                     │
-  │  "vectors"      NodeId → packed f32 bytes           │
-  │  "metadata"     NodeId → JSON bytes                 │
-  │  "graph_nodes"  NodeId → bincode(level, neighbors)  │
-  │  "config"       "v1"   → bincode(dim, metric, HNSW) │
-  └─────────────────────────────────────────────────────┘
+HTTP POST /v1/collections/:name/vectors
+  └─► auth_layer (X-API-KEY check)
+  └─► insert_vector handler
+  └─► LumenEngine::insert()
+        ├─► HnswIndex::insert_and_get_modified()   [write lock]
+        ├─► SledVault::put()                        [vector + meta + graph node]
+        ├─► SledVault::update_graph_node() × N      [back-edge persistence]
+        └─► SledVault::flush()                      [fsync — WAL sealed]
+```
+
+**Data flow — search:**
+
+```
+HTTP POST /v1/collections/:name/search
+  └─► auth_layer
+  └─► search_vectors handler
+  └─► LumenEngine::search()
+        ├─► HnswIndex::search()                     [read lock — concurrent]
+        │     ├─► Phase 1: coarse greedy descent (ef=1, layers L..1)
+        │     └─► Phase 2: beam search at layer 0  (ef=ef_search, SIMD dist)
+        └─► SledVault::get_metadata() × k           [enrich results]
 ```
 
 ---
