@@ -477,4 +477,4 @@ The source code in this repository is **not open source**. Viewing the source
 for evaluation purposes is permitted. Redistribution, modification, or use in
 commercial products requires a written license.
 
-For licensing enquiries: **umaiesajid@gmail.com*
+For licensing enquiries: **umaiesajid@gmail.com**
