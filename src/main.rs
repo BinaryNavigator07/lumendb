@@ -1,37 +1,3 @@
-//! LumenDB — Milestone 4: The Nexus (Axum REST gateway).
-//!
-//! # Usage
-//!
-//! ```sh
-//! # Start with defaults (port 7070, no auth, ./lumendb_data)
-//! cargo run --release
-//!
-//! # Custom port + API key
-//! cargo run --release -- --port 8080 --api-key secret123
-//!
-//! # Persist collections somewhere else
-//! cargo run --release -- --data-dir /var/lib/lumendb
-//! ```
-//!
-//! # Quick-start (curl)
-//!
-//! ```sh
-//! # Create a 3-dim cosine collection
-//! curl -s -X POST http://localhost:7070/v1/collections \
-//!   -H 'Content-Type: application/json' \
-//!   -d '{"name":"demo","dim":3,"metric":"cosine"}' | jq
-//!
-//! # Insert a vector
-//! curl -s -X POST http://localhost:7070/v1/collections/demo/vectors \
-//!   -H 'Content-Type: application/json' \
-//!   -d '{"vector":[1.0,0.0,0.0],"metadata":{"label":"x-axis"}}' | jq
-//!
-//! # Search
-//! curl -s -X POST http://localhost:7070/v1/collections/demo/search \
-//!   -H 'Content-Type: application/json' \
-//!   -d '{"vector":[1.0,0.1,0.0],"k":1}' | jq
-//! ```
-
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,41 +9,26 @@ use lumendb::{
     LumenEngine,
 };
 
-// ── CLI ───────────────────────────────────────────────────────────────────────
-
 #[derive(Parser, Debug)]
-#[command(
-    name    = "lumendb",
-    version,
-    about   = "LumenDB — pure-Rust vector search engine with REST API",
-    long_about = None,
-)]
+#[command(name = "lumendb", version, about = "LumenDB — pure-Rust vector search engine with REST API")]
 struct Args {
-    /// TCP port to listen on.
     #[arg(long, default_value = "7070")]
     port: u16,
 
-    /// Host address to bind (use 0.0.0.0 to accept external connections).
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
-    /// Base directory where collections are stored on disk.
     #[arg(long, default_value = "./lumendb_data")]
     data_dir: PathBuf,
 
-    /// Require this value in the `X-API-KEY` request header.
-    /// If omitted, the API is unauthenticated (development mode).
     #[arg(long)]
     api_key: Option<String>,
 }
-
-// ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
 
-    // Ensure the data directory exists
     std::fs::create_dir_all(&args.data_dir)
         .unwrap_or_else(|e| panic!("cannot create data directory {:?}: {e}", args.data_dir));
 
@@ -87,10 +38,6 @@ async fn main() {
 
     let state = AppState::new(args.data_dir.clone(), args.api_key.clone());
 
-    // ── Auto-load existing collections from disk ──────────────────────────────
-    // Any subdirectory that contains a valid LumenDB Sled database is opened
-    // automatically so collections survive server restarts without needing to
-    // be explicitly re-created via the API.
     let mut loaded = 0usize;
     if let Ok(entries) = std::fs::read_dir(&args.data_dir) {
         for entry in entries.flatten() {
@@ -106,14 +53,13 @@ async fn main() {
                     eprintln!("  Loaded '{name}'  ({n} vectors)");
                     loaded += 1;
                 }
-                Err(_) => {} // not a LumenDB directory — silently skip
+                Err(_) => {}
             }
         }
     }
 
     let app = build_router(state);
 
-    // ── Banner ────────────────────────────────────────────────────────────────
     println!("╔══════════════════════════════════════════════╗");
     println!("║             LumenDB  v{}                  ║", env!("CARGO_PKG_VERSION"));
     println!("║          Milestone 4 — The Nexus             ║");
@@ -133,9 +79,10 @@ async fn main() {
     println!("  Press Ctrl+C to stop.");
     println!();
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .unwrap_or_else(|e| panic!("cannot bind to {addr}: {e}"));
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap_or_else(|e| {
+        eprintln!("error: cannot bind to {addr}: {e}");
+        std::process::exit(1);
+    });
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -144,8 +91,6 @@ async fn main() {
 
     println!("\nServer shut down gracefully.");
 }
-
-// ── Graceful shutdown ─────────────────────────────────────────────────────────
 
 async fn shutdown_signal() {
     use tokio::signal;

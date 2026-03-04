@@ -1,13 +1,3 @@
-//! Binary serialization helpers (FR-4 / NFR-2).
-//!
-//! Three encoding schemes are used, each chosen for its purpose:
-//!
-//! | Data         | Encoding          | Reason                              |
-//! |--------------|-------------------|-------------------------------------|
-//! | Vectors      | Raw LE f32 bytes  | Zero-copy, fastest possible         |
-//! | Metadata     | JSON              | Human-readable, schema-flexible     |
-//! | Config/Graph | Bincode + Serde   | Compact binary for structured data  |
-
 use serde::{Deserialize, Serialize};
 
 use crate::index::params::HnswParams;
@@ -15,13 +5,6 @@ use crate::index::node::NodeId;
 use crate::metrics::Metric;
 use crate::LumenError;
 
-// ── NodeId ↔ Sled key ─────────────────────────────────────────────────────────
-
-/// Encode a `NodeId` as an 8-byte big-endian key.
-///
-/// Big-endian is critical: Sled iterates keys in lexicographic byte order.
-/// With BE encoding, numeric order == byte order, so `iter()` yields vectors
-/// in insertion order (0, 1, 2, …) — essential for the recovery replay loop.
 #[inline]
 pub fn id_to_key(id: NodeId) -> [u8; 8] {
     (id as u64).to_be_bytes()
@@ -33,10 +16,6 @@ pub fn key_to_id(bytes: &[u8]) -> NodeId {
     u64::from_be_bytes(arr) as NodeId
 }
 
-// ── f32 vector ↔ raw bytes ────────────────────────────────────────────────────
-
-/// Encode a `&[f32]` as packed little-endian bytes.
-/// Allocates exactly `n * 4` bytes.
 pub fn encode_vector(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 4);
     for &x in v {
@@ -45,16 +24,12 @@ pub fn encode_vector(v: &[f32]) -> Vec<u8> {
     out
 }
 
-/// Decode packed little-endian bytes back into `Vec<f32>`.
-/// Silently discards trailing bytes that don't form a complete f32.
 pub fn decode_vector(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect()
 }
-
-// ── Metadata ↔ JSON ───────────────────────────────────────────────────────────
 
 pub fn encode_meta(m: &serde_json::Value) -> Result<Vec<u8>, LumenError> {
     serde_json::to_vec(m).map_err(LumenError::from)
@@ -64,14 +39,10 @@ pub fn decode_meta(bytes: &[u8]) -> Result<serde_json::Value, LumenError> {
     serde_json::from_slice(bytes).map_err(LumenError::from)
 }
 
-// ── Database config ↔ bincode ─────────────────────────────────────────────────
-
-/// Persisted database configuration stored in the `config` Sled tree.
-/// Loaded on startup to verify that the opening parameters match the stored ones.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredConfig {
     pub dim: usize,
-    pub metric: u8,            // 0 = DotProduct, 1 = Euclidean, 2 = Cosine
+    pub metric: u8,
     pub m: usize,
     pub ef_construction: usize,
     pub ef_search: usize,
@@ -109,11 +80,6 @@ pub fn decode_config(bytes: &[u8]) -> Result<StoredConfig, LumenError> {
     bincode::deserialize(bytes).map_err(LumenError::from)
 }
 
-// ── Graph node state ↔ bincode ────────────────────────────────────────────────
-
-/// Minimal graph snapshot stored per node.
-/// Enables O(1) warm boot by directly restoring the adjacency lists
-/// rather than replaying the full insertion algorithm.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StoredNode {
     pub level: usize,
@@ -127,8 +93,6 @@ pub fn encode_node(n: &StoredNode) -> Result<Vec<u8>, LumenError> {
 pub fn decode_node(bytes: &[u8]) -> Result<StoredNode, LumenError> {
     bincode::deserialize(bytes).map_err(LumenError::from)
 }
-
-// ── Metric helpers ────────────────────────────────────────────────────────────
 
 fn metric_to_u8(m: Metric) -> u8 {
     match m {
@@ -146,8 +110,6 @@ fn u8_to_metric(v: u8) -> Result<Metric, LumenError> {
         _ => Err(LumenError::Codec(format!("unknown metric byte: {v}"))),
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -170,7 +132,6 @@ mod tests {
 
     #[test]
     fn id_key_lexicographic_order() {
-        // Big-endian keys must sort the same as the numeric values
         let keys: Vec<[u8; 8]> = (0u64..10).map(|i| i.to_be_bytes()).collect();
         let mut sorted = keys.clone();
         sorted.sort();
@@ -183,7 +144,7 @@ mod tests {
         let bytes = encode_config(&cfg).unwrap();
         let back  = decode_config(&bytes).unwrap();
         assert_eq!(back.dim, 1536);
-        assert_eq!(back.metric, 2); // Cosine
+        assert_eq!(back.metric, 2);
     }
 
     #[test]

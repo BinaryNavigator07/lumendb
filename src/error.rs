@@ -1,27 +1,12 @@
 use std::fmt;
 
-/// Unified error type for all LumenDB operations.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LumenError {
-    // ── Metric errors (Milestone 1) ───────────────────────────────────────────
-    /// Operands have different numbers of dimensions.
     DimensionMismatch { expected: usize, got: usize },
-
-    /// A zero-magnitude vector was supplied where a unit vector is required
-    /// (e.g. cosine similarity of the zero vector is undefined).
     ZeroVector,
-
-    /// An empty slice was supplied where a non-empty one is required.
     EmptyVector,
-
-    // ── Storage errors (Milestone 3) ──────────────────────────────────────────
-    /// Wraps a Sled I/O error.
     Storage(String),
-
-    /// Serialization / deserialization failure.
     Codec(String),
-
-    /// The database was opened with a different configuration than expected.
     ConfigMismatch(String),
 }
 

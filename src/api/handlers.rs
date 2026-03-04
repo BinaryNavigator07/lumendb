@@ -1,17 +1,3 @@
-//! Route handlers for the Nexus REST API.
-//!
-//! ## Endpoint map
-//!
-//! ```text
-//! GET  /health
-//! POST /v1/collections                        — create collection
-//! GET  /v1/collections/:name                  — get collection info
-//! DELETE /v1/collections/:name                — remove collection
-//! POST /v1/collections/:name/vectors          — insert a vector
-//! POST /v1/collections/:name/search           — KNN search
-//! GET  /v1/collections/:name/vectors/:id      — fetch metadata by id
-//! ```
-
 use std::sync::Arc;
 
 use axum::{
@@ -26,8 +12,6 @@ use crate::{index::params::HnswParams, metrics::Metric, LumenEngine};
 
 use super::{error::ApiError, AppState};
 
-// ── Health ────────────────────────────────────────────────────────────────────
-
 #[derive(Serialize)]
 pub struct HealthResp {
     status:  &'static str,
@@ -41,19 +25,17 @@ pub async fn health() -> Json<HealthResp> {
     })
 }
 
-// ── Collections ───────────────────────────────────────────────────────────────
-
 #[derive(Deserialize)]
 pub struct CreateCollectionReq {
-    pub name:             String,
-    pub dim:              usize,
-    pub metric:           Metric,
+    pub name:            String,
+    pub dim:             usize,
+    pub metric:          Metric,
     #[serde(default)]
-    pub m:                Option<usize>,
+    pub m:               Option<usize>,
     #[serde(default)]
-    pub ef_construction:  Option<usize>,
+    pub ef_construction: Option<usize>,
     #[serde(default)]
-    pub ef_search:        Option<usize>,
+    pub ef_search:       Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -64,10 +46,6 @@ pub struct CollectionInfo {
     count:  usize,
 }
 
-/// `POST /v1/collections`
-///
-/// Creates a new collection.  Returns `409 Conflict` if the name is already
-/// in use (either in memory or on disk).
 pub async fn create_collection(
     State(state): State<AppState>,
     Json(req):    Json<CreateCollectionReq>,
@@ -83,7 +61,6 @@ pub async fn create_collection(
 
     let col_path = state.base_dir.join(&req.name);
 
-    // Guard: already in memory?
     {
         let cols = state.collections.read();
         if cols.contains_key(&req.name) {
@@ -93,7 +70,6 @@ pub async fn create_collection(
             )));
         }
     }
-    // Guard: already on disk?
     if col_path.exists() {
         return Err(ApiError::Conflict(format!(
             "collection '{}' already exists on disk — use GET /v1/collections/{} to inspect it",
@@ -111,7 +87,6 @@ pub async fn create_collection(
     let dim    = req.dim;
     let name   = req.name.clone();
 
-    // LumenEngine::open is blocking (Sled I/O) — offload to a thread-pool worker.
     let engine = tokio::task::spawn_blocking(move || {
         LumenEngine::open(&col_path, params, metric, dim)
     })
@@ -131,7 +106,6 @@ pub async fn create_collection(
     Ok((StatusCode::CREATED, Json(info)))
 }
 
-/// `GET /v1/collections/:name`
 pub async fn get_collection(
     State(state): State<AppState>,
     Path(name):   Path<String>,
@@ -145,11 +119,6 @@ pub async fn get_collection(
     }))
 }
 
-/// `DELETE /v1/collections/:name`
-///
-/// Removes the collection from the server's in-memory registry.
-/// The on-disk data is intentionally left intact (it can be re-loaded later
-/// or deleted manually).
 pub async fn delete_collection(
     State(state): State<AppState>,
     Path(name):   Path<String>,
@@ -160,8 +129,6 @@ pub async fn delete_collection(
     }
     Ok(StatusCode::NO_CONTENT)
 }
-
-// ── Vectors ───────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct InsertReq {
@@ -175,22 +142,18 @@ pub struct InsertResp {
     pub id: usize,
 }
 
-/// `POST /v1/collections/:name/vectors`
 pub async fn insert_vector(
     State(state): State<AppState>,
     Path(name):   Path<String>,
     Json(req):    Json<InsertReq>,
 ) -> Result<Json<InsertResp>, ApiError> {
     let engine = require_collection(&state, &name)?;
-    // insert is blocking (HNSW write + Sled fsync)
     let id = tokio::task::spawn_blocking(move || engine.insert(req.vector, req.metadata))
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .map_err(ApiError::from)?;
     Ok(Json(InsertResp { id }))
 }
-
-// ── Search ────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct SearchReq {
@@ -210,7 +173,6 @@ pub struct SearchResp {
     pub results: Vec<SearchHitResp>,
 }
 
-/// `POST /v1/collections/:name/search`
 pub async fn search_vectors(
     State(state): State<AppState>,
     Path(name):   Path<String>,
@@ -220,7 +182,6 @@ pub async fn search_vectors(
         return Err(ApiError::BadRequest("k must be > 0".into()));
     }
     let engine = require_collection(&state, &name)?;
-    // search reads Sled for metadata — offload to keep tokio threads responsive
     let hits = tokio::task::spawn_blocking(move || engine.search(&req.vector, req.k))
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?
@@ -233,17 +194,14 @@ pub async fn search_vectors(
     Ok(Json(SearchResp { results }))
 }
 
-// ── Vector metadata lookup ────────────────────────────────────────────────────
-
 #[derive(Serialize)]
 pub struct VectorMetaResp {
     pub id:       usize,
     pub metadata: Value,
 }
 
-/// `GET /v1/collections/:name/vectors/:id`
 pub async fn get_vector_meta(
-    State(state):    State<AppState>,
+    State(state):     State<AppState>,
     Path((name, id)): Path<(String, usize)>,
 ) -> Result<Json<VectorMetaResp>, ApiError> {
     let engine = require_collection(&state, &name)?;
@@ -254,8 +212,6 @@ pub async fn get_vector_meta(
         .unwrap_or(Value::Null);
     Ok(Json(VectorMetaResp { id, metadata: meta }))
 }
-
-// ── Private helper ────────────────────────────────────────────────────────────
 
 fn require_collection(state: &AppState, name: &str) -> Result<Arc<LumenEngine>, ApiError> {
     state
