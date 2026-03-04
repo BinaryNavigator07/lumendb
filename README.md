@@ -6,7 +6,7 @@
 
 *Why is your vector database a 500 MB Docker image?*
 
-[![Rust](https://img.shields.io/badge/Rust-2021_Edition-orange?logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-2026_Edition-orange?logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-Proprietary-red)](#license)
 [![Binary](https://img.shields.io/badge/Binary-1.7_MB_(Linux_arm64)-brightgreen)](#download)
 [![API](https://img.shields.io/badge/API-REST_(Axum)-blue)](#api-reference)
